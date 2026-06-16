@@ -1,3 +1,5 @@
+from datetime import UTC, datetime, timedelta
+
 from app.models import BookingStatus
 from tests.helpers import create_booking_with_status
 
@@ -25,6 +27,15 @@ async def test_post_bookings_rejects_invalid_datetime(client, sample_payload):
     response = await client.post("/bookings", json=sample_payload)
 
     assert response.status_code == 422
+
+
+async def test_post_bookings_rejects_past_datetime(client, sample_payload):
+    sample_payload["datetime"] = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+
+    response = await client.post("/bookings", json=sample_payload)
+
+    assert response.status_code == 422
+    assert "datetime must be in the future" in response.text
 
 
 async def test_post_bookings_rate_limit_returns_429(client, sample_payload):
