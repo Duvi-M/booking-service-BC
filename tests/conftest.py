@@ -46,19 +46,25 @@ async def db_session(session_factory) -> AsyncGenerator[AsyncSession, None]:
 
 
 @pytest.fixture
-def sync_session() -> Generator[Session, None, None]:
+def sync_engine() -> Generator:
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
-    factory = sessionmaker(bind=engine, class_=Session, expire_on_commit=False)
     Base.metadata.create_all(engine)
+
+    yield engine
+
+    engine.dispose()
+
+
+@pytest.fixture
+def sync_session(sync_engine) -> Generator[Session, None, None]:
+    factory = sessionmaker(bind=sync_engine, class_=Session, expire_on_commit=False)
 
     with factory() as session:
         yield session
-
-    engine.dispose()
 
 
 @pytest_asyncio.fixture
