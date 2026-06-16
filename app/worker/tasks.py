@@ -1,17 +1,15 @@
-import asyncio
 import random
 import uuid
 
 import structlog
 from celery.exceptions import Retry
 from sqlalchemy import func, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
-from app import crud
 from app.config import get_settings
-from app.database import async_session_factory
 from app.models import Booking, BookingStatus
 from app.worker.celery_app import celery_app
+from app.worker.db import sync_session_factory
 
 logger = structlog.get_logger(__name__)
 
@@ -21,11 +19,11 @@ def external_booking_confirmation_failed() -> bool:
     return random.random() < settings.external_failure_probability
 
 
-async def process_booking_confirmation(
-    session: AsyncSession,
+def process_booking_confirmation(
+    session: Session,
     booking_id: uuid.UUID,
 ) -> BookingStatus | None:
-    booking = await crud.get_booking(session, booking_id)
+    booking = session.get(Booking, booking_id)
     if booking is None:
         logger.info("booking_task_skipped", booking_id=str(booking_id), reason="not_found")
         return None
@@ -53,15 +51,15 @@ async def process_booking_confirmation(
         .values(status=new_status, updated_at=func.now())
         .returning(Booking.id, Booking.service_type)
     )
-    result = await session.execute(statement)
+    result = session.execute(statement)
     updated_booking = result.one_or_none()
 
     if updated_booking is None:
-        await session.rollback()
-        booking = await crud.get_booking(session, booking_id)
+        session.rollback()
+        booking = session.get(Booking, booking_id)
         return booking.status if booking else None
 
-    await session.commit()
+    session.commit()
 
     if new_status == BookingStatus.failed:
         logger.info("booking_confirmation_failed", booking_id=str(booking.id))
@@ -76,10 +74,10 @@ async def process_booking_confirmation(
     return BookingStatus.confirmed
 
 
-async def _confirm_booking_async(booking_id: str) -> str | None:
+def _confirm_booking(booking_id: str) -> str | None:
     parsed_booking_id = uuid.UUID(booking_id)
-    async with async_session_factory() as session:
-        status = await process_booking_confirmation(session, parsed_booking_id)
+    with sync_session_factory() as session:
+        status = process_booking_confirmation(session, parsed_booking_id)
         return status.value if status else None
 
 
@@ -94,6 +92,6 @@ async def _confirm_booking_async(booking_id: str) -> str | None:
 )
 def confirm_booking_task(self, booking_id: str) -> str | None:
     try:
-        return asyncio.run(_confirm_booking_async(booking_id))
+        return _confirm_booking(booking_id)
     except Retry:
         raise

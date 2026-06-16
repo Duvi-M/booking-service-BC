@@ -1,11 +1,14 @@
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Generator
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app.api.bookings import _rate_buckets
 from app.database import Base, get_session
@@ -41,6 +44,22 @@ async def db_session(session_factory) -> AsyncGenerator[AsyncSession, None]:
         yield session
 
 
+@pytest.fixture
+def sync_session() -> Generator[Session, None, None]:
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    factory = sessionmaker(bind=engine, class_=Session, expire_on_commit=False)
+    Base.metadata.create_all(engine)
+
+    with factory() as session:
+        yield session
+
+    engine.dispose()
+
+
 @pytest_asyncio.fixture
 async def client(session_factory, monkeypatch) -> AsyncGenerator[AsyncClient, None]:
     async def override_get_session() -> AsyncGenerator[AsyncSession, None]:
@@ -73,4 +92,3 @@ async def booking(db_session: AsyncSession) -> Booking:
     await db_session.commit()
     await db_session.refresh(item)
     return item
-
