@@ -64,7 +64,26 @@ def test_task_atomic_update_loses_race_does_not_duplicate_notification(
     monkeypatch.setattr(tasks, "logger", logger_mock)
 
     with factory() as session_a, factory() as session_b:
-        assert session_b.get(Booking, booking.id).status == BookingStatus.pending
+        stale_booking = session_b.get(Booking, booking.id)
+        assert stale_booking.status == BookingStatus.pending
+        update_results = []
+        original_execute = session_b.execute
+
+        def execute_spy(*args, **kwargs):
+            result = original_execute(*args, **kwargs)
+
+            class ResultProxy:
+                def __getattr__(self, name):
+                    return getattr(result, name)
+
+                def one_or_none(self):
+                    value = result.one_or_none()
+                    update_results.append(value)
+                    return value
+
+            return ResultProxy()
+
+        session_b.execute = execute_spy
         statement = (
             update(Booking)
             .where(
@@ -78,11 +97,11 @@ def test_task_atomic_update_loses_race_does_not_duplicate_notification(
         assert result.one_or_none() is not None
         session_a.commit()
 
-        session_b.expire_all()
         status = process_booking_confirmation(session_b, booking.id)
 
     assert status == BookingStatus.confirmed
-    external_mock.assert_not_called()
+    assert update_results == [None]
+    external_mock.assert_called_once()
     notification_calls = [
         call
         for call in logger_mock.info.call_args_list
