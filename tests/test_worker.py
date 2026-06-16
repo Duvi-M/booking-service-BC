@@ -2,45 +2,47 @@ import uuid
 from unittest.mock import Mock
 
 from sqlalchemy import func, update
-from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import Booking, BookingStatus
 from app.worker import tasks
 from app.worker.tasks import process_booking_confirmation
-from tests.helpers import create_sync_booking_with_status
+from tests.helpers import create_booking_with_status
 
 
-def test_task_returns_none_when_booking_not_found(sync_session, monkeypatch):
+async def test_task_returns_none_when_booking_not_found(worker_session, monkeypatch):
     external_mock = Mock(return_value=False)
     monkeypatch.setattr(tasks, "external_booking_confirmation_failed", external_mock)
 
-    status = process_booking_confirmation(sync_session, uuid.uuid4())
+    status = await process_booking_confirmation(worker_session, uuid.uuid4())
 
     assert status is None
     external_mock.assert_not_called()
 
 
-def test_successful_task_changes_pending_to_confirmed(sync_session, monkeypatch):
-    booking = create_sync_booking_with_status(sync_session, BookingStatus.pending)
+async def test_successful_task_changes_pending_to_confirmed(worker_session, monkeypatch):
+    booking = await create_booking_with_status(worker_session, BookingStatus.pending)
     monkeypatch.setattr(tasks, "external_booking_confirmation_failed", Mock(return_value=False))
 
-    status = process_booking_confirmation(sync_session, booking.id)
-    refreshed = sync_session.get(Booking, booking.id)
+    status = await process_booking_confirmation(worker_session, booking.id)
+    refreshed = await worker_session.get(Booking, booking.id)
 
     assert status == BookingStatus.confirmed
     assert refreshed is not None
     assert refreshed.status == BookingStatus.confirmed
 
 
-def test_task_atomic_idempotency_does_not_repeat_notification(sync_session, monkeypatch):
-    booking = create_sync_booking_with_status(sync_session, BookingStatus.pending)
+async def test_task_atomic_idempotency_does_not_repeat_notification(
+    worker_session,
+    monkeypatch,
+):
+    booking = await create_booking_with_status(worker_session, BookingStatus.pending)
     external_mock = Mock(return_value=False)
     logger_mock = Mock()
     monkeypatch.setattr(tasks, "external_booking_confirmation_failed", external_mock)
     monkeypatch.setattr(tasks, "logger", logger_mock)
 
-    first_status = process_booking_confirmation(sync_session, booking.id)
-    second_status = process_booking_confirmation(sync_session, booking.id)
+    first_status = await process_booking_confirmation(worker_session, booking.id)
+    second_status = await process_booking_confirmation(worker_session, booking.id)
 
     assert first_status == BookingStatus.confirmed
     assert second_status == BookingStatus.confirmed
@@ -51,26 +53,25 @@ def test_task_atomic_idempotency_does_not_repeat_notification(sync_session, monk
     assert len(notification_calls) == 1
 
 
-def test_task_atomic_update_loses_race_does_not_duplicate_notification(
-    sync_session,
-    sync_engine,
+async def test_task_atomic_update_loses_race_does_not_duplicate_notification(
+    worker_session,
+    worker_session_factory,
     monkeypatch,
 ):
-    booking = create_sync_booking_with_status(sync_session, BookingStatus.pending)
-    factory = sessionmaker(bind=sync_engine, class_=Session, expire_on_commit=False)
+    booking = await create_booking_with_status(worker_session, BookingStatus.pending)
     external_mock = Mock(return_value=False)
     logger_mock = Mock()
     monkeypatch.setattr(tasks, "external_booking_confirmation_failed", external_mock)
     monkeypatch.setattr(tasks, "logger", logger_mock)
 
-    with factory() as session_a, factory() as session_b:
-        stale_booking = session_b.get(Booking, booking.id)
+    async with worker_session_factory() as session_a, worker_session_factory() as session_b:
+        stale_booking = await session_b.get(Booking, booking.id)
         assert stale_booking.status == BookingStatus.pending
         update_results = []
         original_execute = session_b.execute
 
-        def execute_spy(*args, **kwargs):
-            result = original_execute(*args, **kwargs)
+        async def execute_spy(*args, **kwargs):
+            result = await original_execute(*args, **kwargs)
 
             class ResultProxy:
                 def __getattr__(self, name):
@@ -93,11 +94,11 @@ def test_task_atomic_update_loses_race_does_not_duplicate_notification(
             .values(status=BookingStatus.confirmed, updated_at=func.now())
             .returning(Booking.id)
         )
-        result = session_a.execute(statement)
+        result = await session_a.execute(statement)
         assert result.one_or_none() is not None
-        session_a.commit()
+        await session_a.commit()
 
-        status = process_booking_confirmation(session_b, booking.id)
+        status = await process_booking_confirmation(session_b, booking.id)
 
     assert status == BookingStatus.confirmed
     assert update_results == [None]
@@ -111,25 +112,25 @@ def test_task_atomic_update_loses_race_does_not_duplicate_notification(
     assert notification_calls == []
 
 
-def test_failed_task_changes_pending_to_failed(sync_session, monkeypatch):
-    booking = create_sync_booking_with_status(sync_session, BookingStatus.pending)
+async def test_failed_task_changes_pending_to_failed(worker_session, monkeypatch):
+    booking = await create_booking_with_status(worker_session, BookingStatus.pending)
     monkeypatch.setattr(tasks, "external_booking_confirmation_failed", Mock(return_value=True))
 
-    status = process_booking_confirmation(sync_session, booking.id)
-    refreshed = sync_session.get(Booking, booking.id)
+    status = await process_booking_confirmation(worker_session, booking.id)
+    refreshed = await worker_session.get(Booking, booking.id)
 
     assert status == BookingStatus.failed
     assert refreshed is not None
     assert refreshed.status == BookingStatus.failed
 
 
-def test_task_is_idempotent_when_booking_already_confirmed(sync_session, monkeypatch):
-    booking = create_sync_booking_with_status(sync_session, BookingStatus.confirmed)
+async def test_task_is_idempotent_when_booking_already_confirmed(worker_session, monkeypatch):
+    booking = await create_booking_with_status(worker_session, BookingStatus.confirmed)
     external_mock = Mock(return_value=True)
     monkeypatch.setattr(tasks, "external_booking_confirmation_failed", external_mock)
 
-    status = process_booking_confirmation(sync_session, booking.id)
-    refreshed = sync_session.get(Booking, booking.id)
+    status = await process_booking_confirmation(worker_session, booking.id)
+    refreshed = await worker_session.get(Booking, booking.id)
 
     assert status == BookingStatus.confirmed
     assert refreshed is not None
@@ -137,13 +138,13 @@ def test_task_is_idempotent_when_booking_already_confirmed(sync_session, monkeyp
     external_mock.assert_not_called()
 
 
-def test_task_does_not_confirm_cancelled_booking(sync_session, monkeypatch):
-    booking = create_sync_booking_with_status(sync_session, BookingStatus.cancelled)
+async def test_task_does_not_confirm_cancelled_booking(worker_session, monkeypatch):
+    booking = await create_booking_with_status(worker_session, BookingStatus.cancelled)
     external_mock = Mock(return_value=False)
     monkeypatch.setattr(tasks, "external_booking_confirmation_failed", external_mock)
 
-    status = process_booking_confirmation(sync_session, booking.id)
-    refreshed = sync_session.get(Booking, booking.id)
+    status = await process_booking_confirmation(worker_session, booking.id)
+    refreshed = await worker_session.get(Booking, booking.id)
 
     assert status == BookingStatus.cancelled
     assert refreshed is not None

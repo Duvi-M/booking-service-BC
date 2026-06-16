@@ -1,14 +1,12 @@
-from collections.abc import AsyncGenerator, Generator
+from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
 from fakeredis import FakeRedis
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.api.bookings import get_redis_client
@@ -45,25 +43,34 @@ async def db_session(session_factory) -> AsyncGenerator[AsyncSession, None]:
         yield session
 
 
-@pytest.fixture
-def sync_engine() -> Generator:
-    engine = create_engine(
-        "sqlite://",
+@pytest_asyncio.fixture
+async def async_worker_engine():
+    engine = create_async_engine(
+        "sqlite+aiosqlite://",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
-    Base.metadata.create_all(engine)
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
 
     yield engine
 
-    engine.dispose()
+    await engine.dispose()
 
 
-@pytest.fixture
-def sync_session(sync_engine) -> Generator[Session, None, None]:
-    factory = sessionmaker(bind=sync_engine, class_=Session, expire_on_commit=False)
+@pytest_asyncio.fixture
+async def worker_session_factory(async_worker_engine):
+    return async_sessionmaker(
+        bind=async_worker_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
 
-    with factory() as session:
+
+@pytest_asyncio.fixture
+async def worker_session(worker_session_factory) -> AsyncGenerator[AsyncSession, None]:
+    async with worker_session_factory() as session:
         yield session
 
 
@@ -73,15 +80,15 @@ async def client(session_factory, monkeypatch) -> AsyncGenerator[AsyncClient, No
         async with session_factory() as session:
             yield session
 
-    delay_mock = MagicMock()
+    kiq_mock = AsyncMock()
     redis_client = FakeRedis()
-    monkeypatch.setattr("app.api.bookings.confirm_booking_task.delay", delay_mock)
+    monkeypatch.setattr("app.api.bookings.confirm_booking_task.kiq", kiq_mock)
     app.dependency_overrides[get_session] = override_get_session
     app.dependency_overrides[get_redis_client] = lambda: redis_client
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as async_client:
-        async_client.celery_delay_mock = delay_mock
+        async_client.task_kiq_mock = kiq_mock
         yield async_client
 
     app.dependency_overrides.clear()

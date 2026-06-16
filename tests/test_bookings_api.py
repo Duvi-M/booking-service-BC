@@ -12,7 +12,7 @@ async def test_post_bookings_creates_pending_booking(client, sample_payload):
     assert data["name"] == sample_payload["name"]
     assert data["service_type"] == sample_payload["service_type"]
     assert data["status"] == "pending"
-    client.celery_delay_mock.assert_called_once_with(data["id"])
+    client.task_kiq_mock.assert_awaited_once_with(data["id"])
 
 
 async def test_post_bookings_validates_required_fields(client):
