@@ -4,13 +4,14 @@ from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
+from fakeredis import FakeRedis
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.api.bookings import _rate_buckets
+from app.api.bookings import get_redis_client
 from app.database import Base, get_session
 from app.main import app
 from app.models import Booking, BookingStatus
@@ -67,9 +68,10 @@ async def client(session_factory, monkeypatch) -> AsyncGenerator[AsyncClient, No
             yield session
 
     delay_mock = MagicMock()
+    redis_client = FakeRedis()
     monkeypatch.setattr("app.api.bookings.confirm_booking_task.delay", delay_mock)
-    _rate_buckets.clear()
     app.dependency_overrides[get_session] = override_get_session
+    app.dependency_overrides[get_redis_client] = lambda: redis_client
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as async_client:
@@ -77,7 +79,7 @@ async def client(session_factory, monkeypatch) -> AsyncGenerator[AsyncClient, No
         yield async_client
 
     app.dependency_overrides.clear()
-    _rate_buckets.clear()
+    redis_client.flushall()
 
 
 @pytest_asyncio.fixture

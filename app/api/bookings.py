@@ -1,9 +1,10 @@
 import time
 import uuid
-from collections import defaultdict, deque
+from functools import lru_cache
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from redis import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import crud
@@ -15,28 +16,37 @@ from app.worker.tasks import confirm_booking_task
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
 
-RateBucket = dict[str, deque[float]]
-_rate_buckets: RateBucket = defaultdict(deque)
+RATE_LIMIT_MESSAGE = "Too many booking requests. Please try again later."
+
+
+@lru_cache
+def build_redis_client(redis_url: str) -> Redis:
+    return Redis.from_url(redis_url)
+
+
+def get_redis_client(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> Redis:
+    return build_redis_client(settings.redis_url)
 
 
 def rate_limit(
     request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
+    redis_client: Annotated[Redis, Depends(get_redis_client)],
 ) -> None:
     client = request.client.host if request.client else "unknown"
-    now = time.monotonic()
-    bucket = _rate_buckets[client]
+    window = int(time.time() // settings.rate_limit_window_seconds)
+    key = f"rate_limit:bookings:{client}:{window}"
+    count = redis_client.incr(key)
+    if count == 1:
+        redis_client.expire(key, settings.rate_limit_window_seconds)
 
-    while bucket and now - bucket[0] > settings.rate_limit_window_seconds:
-        bucket.popleft()
-
-    if len(bucket) >= settings.rate_limit_requests:
+    if count > settings.rate_limit_requests:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many booking requests. Please try again later.",
+            detail=RATE_LIMIT_MESSAGE,
         )
-
-    bucket.append(now)
 
 
 @router.post(
