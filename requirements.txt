@@ -7,8 +7,9 @@ aiosqlite==0.20.0
 alembic==1.14.0
 pydantic==2.10.4
 pydantic-settings==2.7.0
-celery[redis]==5.4.0
-redis==5.2.1
+taskiq==0.12.4
+taskiq-redis==1.2.2
+redis==7.4.1
 fakeredis==2.26.2
 structlog==24.4.0
 pytest==8.3.4
