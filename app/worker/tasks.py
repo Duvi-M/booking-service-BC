@@ -4,12 +4,13 @@ import uuid
 
 import structlog
 from celery.exceptions import Retry
+from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import crud
 from app.config import get_settings
 from app.database import async_session_factory
-from app.models import BookingStatus
+from app.models import Booking, BookingStatus
 from app.worker.celery_app import celery_app
 
 logger = structlog.get_logger(__name__)
@@ -38,18 +39,38 @@ async def process_booking_confirmation(
         )
         return booking.status
 
-    if external_booking_confirmation_failed():
-        booking.status = BookingStatus.failed
-        await session.commit()
+    new_status = (
+        BookingStatus.failed
+        if external_booking_confirmation_failed()
+        else BookingStatus.confirmed
+    )
+    statement = (
+        update(Booking)
+        .where(
+            Booking.id == booking_id,
+            Booking.status == BookingStatus.pending,
+        )
+        .values(status=new_status, updated_at=func.now())
+        .returning(Booking.id, Booking.service_type)
+    )
+    result = await session.execute(statement)
+    updated_booking = result.one_or_none()
+
+    if updated_booking is None:
+        await session.rollback()
+        booking = await crud.get_booking(session, booking_id)
+        return booking.status if booking else None
+
+    await session.commit()
+
+    if new_status == BookingStatus.failed:
         logger.info("booking_confirmation_failed", booking_id=str(booking.id))
         return BookingStatus.failed
 
-    booking.status = BookingStatus.confirmed
-    await session.commit()
     logger.info(
         "notification_sent",
-        booking_id=str(booking.id),
-        service_type=booking.service_type,
+        booking_id=str(updated_booking.id),
+        service_type=updated_booking.service_type,
         status=BookingStatus.confirmed.value,
     )
     return BookingStatus.confirmed

@@ -30,6 +30,25 @@ async def test_successful_task_changes_pending_to_confirmed(db_session, monkeypa
     assert refreshed.status == BookingStatus.confirmed
 
 
+async def test_task_atomic_idempotency_does_not_repeat_notification(db_session, monkeypatch):
+    booking = await create_booking_with_status(db_session, BookingStatus.pending)
+    external_mock = Mock(return_value=False)
+    logger_mock = Mock()
+    monkeypatch.setattr(tasks, "external_booking_confirmation_failed", external_mock)
+    monkeypatch.setattr(tasks, "logger", logger_mock)
+
+    first_status = await process_booking_confirmation(db_session, booking.id)
+    second_status = await process_booking_confirmation(db_session, booking.id)
+
+    assert first_status == BookingStatus.confirmed
+    assert second_status == BookingStatus.confirmed
+    external_mock.assert_called_once()
+    notification_calls = [
+        call for call in logger_mock.info.call_args_list if call.args == ("notification_sent",)
+    ]
+    assert len(notification_calls) == 1
+
+
 async def test_failed_task_changes_pending_to_failed(db_session, monkeypatch):
     booking = await create_booking_with_status(db_session, BookingStatus.pending)
     monkeypatch.setattr(tasks, "external_booking_confirmation_failed", Mock(return_value=True))
