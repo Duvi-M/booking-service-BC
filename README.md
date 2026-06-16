@@ -1,38 +1,98 @@
 # Booking Service
 
-Backend service pequeño, async y listo para entregar como test técnico de Python Backend.
-Permite crear, consultar, listar y cancelar reservas de citas. Cuando se crea una reserva, el
-API la guarda como `pending` y dispara una tarea TaskIQ que simula una integración externa:
-si la integración sale bien, la reserva pasa a `confirmed` y se registra una notificación mock
-en logs JSON; si falla, pasa a `failed`.
+🇷🇺 [Русская версия](README.ru.md)
 
-## Arquitectura general
+Small async backend service built as a professional Python Backend technical assignment.
+It lets clients create, read, list, and cancel appointment bookings. When a booking is created,
+the API stores it as `pending` and enqueues a TaskIQ background task that simulates an external
+integration. If the integration succeeds, the booking becomes `confirmed` and a mock notification
+is written to structured logs. If it fails, the booking becomes `failed`.
 
-- **FastAPI** expone la REST API y valida requests con Pydantic v2.
-- **SQLAlchemy 2.0 async** implementa el acceso a datos de la API y del worker sin bloquear el
-  event loop.
-- **PostgreSQL** es la base de datos de runtime.
-- **Alembic** versiona el schema y crea la tabla `bookings`.
-- **Redis** funciona como broker de TaskIQ y como backend distribuido del rate limit.
-- **TaskIQ** ejecuta el procesamiento async-nativo de confirmación de reservas.
-- **pytest + SQLite async** permiten correr tests sin Docker, Postgres ni Redis reales.
-- **Docker Compose** levanta API, worker, PostgreSQL y Redis con una sola orden.
+## Quick Start
 
-## Por qué estas decisiones
+```bash
+docker compose up --build
+```
 
-**FastAPI** encaja bien para un servicio REST pequeño: validación clara, OpenAPI automático,
-soporte async nativo y bajo coste de mantenimiento.
+- API: `http://localhost:8000`
+- Interactive API docs: `http://localhost:8000/docs`
 
-**TaskIQ + Redis** separa el request HTTP del trabajo externo. El API responde rápido y la
-confirmación queda delegada al worker. TaskIQ permite mantener el worker async-nativo usando el
-mismo patrón de `AsyncSession` que FastAPI, y Redis mantiene el compose simple.
+```bash
+python3.12 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+pytest
+```
 
-**PostgreSQL + SQLAlchemy + Alembic** da una base robusta para producción: transacciones,
-tipos sólidos, migraciones reproducibles y una capa ORM async sin SQL raw.
+## Architecture Overview
 
-## Idempotencia del worker
+```mermaid
+flowchart TD
+    Client["Client"] -->|"POST /bookings"| API["FastAPI API"]
+    API -->|"save booking pending"| DB[(PostgreSQL)]
+    API -->|"enqueue task"| Redis[(Redis)]
+    Redis -->|"dequeue task"| Worker["TaskIQ Worker"]
+    Worker -->|"confirm booking"| External["Mock External Service"]
+    External -->|"success / failure"| Worker
+    Worker -->|"confirmed / failed"| DB
+    Worker -->|"notification_sent"| Log["Notification Log"]
+```
 
-La task `bookings.confirm_booking` usa un `UPDATE` condicional atómico:
+## Booking Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending
+    pending --> confirmed
+    pending --> failed
+    pending --> cancelled
+```
+
+## Assignment Coverage
+
+- ✅ **REST API:** implements `POST /bookings`, `GET /bookings/{id}`, `GET /bookings` with status
+  filtering and pagination, and `DELETE /bookings/{id}` for pending-only cancellation.
+- ✅ **Background processing:** enqueues a task immediately after booking creation; the worker
+  simulates an external service, applies an approximate 15% business failure probability, updates
+  status to `confirmed` or `failed`, and logs a mock notification on success.
+- ✅ **Idempotency:** worker updates are protected by an atomic conditional `UPDATE`, so repeated or
+  concurrent task execution does not duplicate side effects or corrupt status.
+- ✅ **Storage and infrastructure:** PostgreSQL, Redis, Alembic migrations, Docker Compose, and
+  `.env.example` are included.
+- ✅ **Tests:** pytest covers API behavior and worker logic, and runs from the repository root
+  without Docker.
+- ✅ **Bonus items:** exponential backoff retry, structured JSON logging, distributed rate limiting,
+  async FastAPI + TaskIQ instead of Celery, and a Makefile with `dev`, `test`, `lint`, `migrate`,
+  and `revision`.
+
+## General Architecture
+
+- **FastAPI** exposes the REST API and validates requests with Pydantic v2.
+- **SQLAlchemy 2.0 async** handles database access for both the API and the worker without
+  blocking the event loop.
+- **PostgreSQL** is the runtime database.
+- **Alembic** versions the schema and manages migrations for the `bookings` table.
+- **Redis** is used as the TaskIQ broker and as the distributed rate-limit backend.
+- **TaskIQ** runs async-native background processing for booking confirmation.
+- **pytest + SQLite async** allow tests to run without Docker, PostgreSQL, or a real Redis.
+- **Docker Compose** starts the API, worker, PostgreSQL, and Redis with one command.
+
+## Why These Decisions
+
+**FastAPI** is a good fit for a compact REST service: clear validation, automatic OpenAPI,
+native async support, and low maintenance overhead.
+
+**TaskIQ + Redis** decouples the HTTP request from external work. The API responds quickly while
+confirmation is delegated to the worker. TaskIQ is used as the allowed async alternative to Celery,
+letting the worker stay async-native with the same `AsyncSession` pattern used by FastAPI, while
+Redis keeps the Compose setup simple.
+
+**PostgreSQL + SQLAlchemy + Alembic** provide a production-friendly foundation: transactions,
+strong data types, reproducible migrations, and an async ORM layer without raw SQL.
+
+## Worker Idempotency
+
+The `bookings.confirm_booking` task uses an atomic conditional `UPDATE`:
 
 ```sql
 UPDATE bookings
@@ -41,27 +101,27 @@ WHERE id = :booking_id AND status = 'pending'
 RETURNING id
 ```
 
-Solo la ejecución que actualiza una fila confirma o falla la reserva y emite logs de resultado.
-Si otra ejecución ya cambió el estado, la task sale sin reenviar notificaciones ni pisar estado.
-Antes de simular la integración externa, el worker consulta el estado actual para evitar trabajo
-innecesario cuando la reserva ya no está `pending`.
+Only the execution that updates one row confirms or fails the booking and emits result logs.
+If another execution has already changed the status, the task exits without sending another
+notification or overwriting state. Before simulating the external integration, the worker reads
+the current status to avoid unnecessary work when the booking is no longer `pending`.
 
-El worker usa el mismo engine async que FastAPI. Ya no hace falta el engine síncrono dedicado que
-existía para rodear la naturaleza prefork/síncrona de Celery.
+The worker uses the same async engine as FastAPI. The dedicated synchronous engine that existed
+for the Celery prefork model is no longer needed.
 
-## Retry con backoff
+## Retry with Backoff
 
-La task TaskIQ implementa retry manual dentro de la corrutina: máximo 3 intentos, backoff
-exponencial y jitter pequeño antes de reintentar. Los fallos esperados de la integración simulada
-no levantan excepción: actualizan la reserva a `failed`. El retry queda reservado para errores
-inesperados de infraestructura o ejecución.
+The TaskIQ task implements retry manually inside the coroutine: up to 3 attempts, exponential
+backoff, and a small jitter before retrying. Expected failures from the simulated integration do
+not raise exceptions; they update the booking to `failed`. Retry is reserved for unexpected
+infrastructure or execution errors.
 
-Nota de implementación: TaskIQ incluye middleware de retry, pero aquí se eligió retry manual para
-mantener el backoff local explícito y no depender de scheduling/requeue diferido para este alcance.
+Implementation note: TaskIQ has retry middleware, but this project uses manual retry to keep the
+local backoff explicit and avoid delayed scheduling/requeue machinery for this small scope.
 
 ## Logging
 
-El servicio usa structured logging JSON con `structlog`. La notificación mock se emite con:
+The service uses structured JSON logging with `structlog`. The mock notification is emitted as:
 
 ```json
 {
@@ -72,23 +132,31 @@ El servicio usa structured logging JSON con `structlog`. La notificación mock s
 }
 ```
 
-## Correr con Docker
+## Run with Docker
 
 ```bash
 docker compose up --build
 ```
 
-El API queda disponible en `http://localhost:8000`. El compose espera healthchecks de
-PostgreSQL y Redis antes de iniciar API/worker. El API ejecuta `alembic upgrade head` al
-arrancar.
+For environments that still use the standalone Compose binary, the equivalent command is:
 
-## Migraciones
+```bash
+docker-compose up --build
+```
+
+The API is available at `http://localhost:8000`. Compose waits for PostgreSQL and Redis
+healthchecks before starting the API and worker. The API runs `alembic upgrade head` on startup.
+
+`docker-compose.yml` uses `.env.example` by default so the stack works out of the box. For local
+customization outside Docker, copy it to `.env` and override values as needed.
+
+## Migrations
 
 ```bash
 make migrate
 ```
 
-Crear una nueva revisión:
+Create a new revision:
 
 ```bash
 make revision message="add new field"
@@ -96,7 +164,7 @@ make revision message="add new field"
 
 ## Tests
 
-Los tests corren sin Docker:
+Tests run without Docker:
 
 ```bash
 python3.12 -m venv .venv
@@ -108,8 +176,14 @@ pip install -r requirements.txt
 pytest
 ```
 
-Durante tests se usa SQLite async para la API y el worker, y `fakeredis` para el rate limit. El
-envío de la task TaskIQ se mockea para evitar Redis real.
+Run linting:
+
+```bash
+ruff check app tests
+```
+
+Tests use SQLite async for the API and worker, and `fakeredis` for rate limiting. TaskIQ task
+enqueueing is mocked so tests do not require a real Redis broker.
 
 ## Makefile
 
@@ -123,7 +197,7 @@ make revision message="..."
 
 ## Endpoints
 
-### Crear reserva
+### Create Booking
 
 ```bash
 curl -X POST http://localhost:8000/bookings \
@@ -135,72 +209,72 @@ curl -X POST http://localhost:8000/bookings \
   }'
 ```
 
-Respuesta: `201 Created`, reserva con `status=pending`.
+Response: `201 Created`, booking with `status=pending`.
 
-### Consultar reserva
+### Get Booking
 
 ```bash
 curl http://localhost:8000/bookings/{booking_id}
 ```
 
-Si no existe, devuelve `404`.
+Returns `404` if the booking does not exist.
 
-### Listar reservas
+### List Bookings
 
 ```bash
 curl "http://localhost:8000/bookings?limit=20&offset=0"
 ```
 
-Filtrar por estado:
+Filter by status:
 
 ```bash
 curl "http://localhost:8000/bookings?status=confirmed&limit=10&offset=0"
 ```
 
-### Cancelar reserva
+### Cancel Booking
 
 ```bash
 curl -X DELETE http://localhost:8000/bookings/{booking_id}
 ```
 
-Solo se puede cancelar si está `pending`. Para `confirmed` o `failed`, devuelve `400`.
-No hay borrado físico: el estado pasa a `cancelled`.
+Only `pending` bookings can be cancelled. For `confirmed` or `failed` bookings, the API returns
+`400`. There is no physical delete; the status changes to `cancelled`.
 
-## Estados
+## States
 
 - `pending`
 - `confirmed`
 - `failed`
 - `cancelled`
 
-## Rate limiting
+## Rate Limiting
 
-`POST /bookings` incluye rate limiting distribuido por IP usando Redis con una ventana fija
-`INCR + EXPIRE`. Esto funciona correctamente con múltiples réplicas de Uvicorn porque el contador
-no vive en memoria local del proceso.
+`POST /bookings` includes distributed per-IP rate limiting using Redis with a fixed
+`INCR + EXPIRE` window. This works correctly with multiple Uvicorn replicas because the counter
+does not live in local process memory.
 
-Trade-off: se eligió ventana fija por simplicidad operacional; una sliding window con sorted sets
-sería más precisa, pero también más costosa para este alcance.
+Trade-off: a fixed window was chosen for operational simplicity. A sliding window based on sorted
+sets would be more precise, but also more expensive for this scope.
 
-## Cambios respecto a la versión anterior
+## Changes from the Previous Version
 
-- Worker idempotente con `UPDATE` condicional atómico.
-- Worker TaskIQ async-nativo con `AsyncSession`, reemplazando Celery y el engine síncrono.
-- Rate limiting movido de memoria local a Redis distribuido.
-- Validación de reservas para rechazar fechas pasadas.
-- Migración de Celery a TaskIQ como quinto plus técnico del backend async.
-- Índice compuesto `(status, created_at DESC)` para listados paginados por estado.
-- Typing moderno en la migración inicial.
-- README actualizado con limitaciones y decisiones vigentes.
+- Worker idempotency is guaranteed with an atomic conditional `UPDATE`.
+- Celery was replaced with async-native TaskIQ, allowing the worker to use `AsyncSession`
+  consistently with the API.
+- Rate limiting moved from local memory to distributed Redis.
+- Booking validation rejects past datetimes.
+- A composite `(status, created_at DESC)` index supports paginated status listings.
+- The initial migration uses modern Python typing.
+- README documentation reflects the current limitations and technical decisions.
 
-## Limitaciones conocidas
+## Known Limitations
 
-- La integración externa está simulada con probabilidad configurable de fallo.
-- La idempotencia del worker está garantizada con `UPDATE` condicional atómico incluso bajo
-  ejecución concurrente.
-- El worker usa `AsyncSession` directamente gracias a TaskIQ; ya no existe engine síncrono
-  específico para tareas.
-- No hay soft-delete ni auditoría histórica de cambios de estado; se conserva el estado final,
-  pero no quién ni cuándo intentó una transición inválida.
-- No hay autenticación/autorización porque está fuera del alcance del test.
-- No se guarda una tabla de notificaciones; el mock queda registrado en logs estructurados.
+- The external integration is simulated with a configurable failure probability.
+- Worker idempotency is guaranteed with an atomic conditional `UPDATE`, including concurrent
+  execution.
+- The worker uses `AsyncSession` directly thanks to TaskIQ; there is no separate synchronous
+  engine for tasks.
+- There is no soft-delete or historical audit of status transitions. The final state is stored,
+  but invalid transition attempts are not tracked with actor/time metadata.
+- There is no authentication or authorization because it is outside the scope of this assignment.
+- Notifications are not stored in a table; the mock notification is written to structured logs.
