@@ -90,10 +90,11 @@ stateDiagram-v2
 **FastAPI** is a good fit for a compact REST service: clear validation, automatic OpenAPI,
 native async support, and low maintenance overhead.
 
-**TaskIQ + Redis** decouples the HTTP request from external work. The API responds quickly while
-confirmation is delegated to the worker. TaskIQ is used as the allowed async alternative to Celery,
-letting the worker stay async-native with the same `AsyncSession` pattern used by FastAPI, while
-Redis keeps the Compose setup simple.
+**TaskIQ + Redis** was chosen intentionally because the assignment lists Celery in the base
+requirements but explicitly allows async FastAPI + TaskIQ instead of Celery as a bonus alternative.
+It decouples the HTTP request from external work. The API responds quickly while confirmation is
+delegated to the worker. TaskIQ lets the worker stay async-native with the same `AsyncSession`
+pattern used by FastAPI, while Redis keeps the Compose setup simple.
 
 **PostgreSQL + SQLAlchemy + Alembic** provide a production-friendly foundation: transactions,
 strong data types, reproducible migrations, and an async ORM layer without raw SQL.
