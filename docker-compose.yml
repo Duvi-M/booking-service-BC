@@ -16,7 +16,7 @@ services:
 
   worker:
     build: .
-    command: celery -A app.worker.celery_app.celery_app worker --loglevel=info
+    command: taskiq worker app.worker.broker:broker app.worker.tasks --log-level=info
     env_file:
       - .env.example
     depends_on:
