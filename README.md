@@ -65,6 +65,14 @@ stateDiagram-v2
   async FastAPI + TaskIQ instead of Celery, and a Makefile with `dev`, `test`, `lint`, `migrate`,
   and `revision`.
 
+## Technical Highlights
+
+- Atomic worker idempotency with a conditional `UPDATE`.
+- Async-native TaskIQ worker using the same `AsyncSession` pattern as the API.
+- Redis-backed distributed rate limiting for `POST /bookings`.
+- Tests run without Docker by using SQLite async and `fakeredis`.
+- Structured logs capture mock external side effects such as `notification_sent`.
+
 ## General Architecture
 
 - **FastAPI** exposes the REST API and validates requests with Pydantic v2.

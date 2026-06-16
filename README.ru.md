@@ -66,6 +66,15 @@ stateDiagram-v2
   limiting, async FastAPI + TaskIQ вместо Celery и Makefile с командами `dev`, `test`, `lint`,
   `migrate`, `revision`.
 
+## Технические акценты
+
+- Идемпотентность worker обеспечена атомарным условным `UPDATE`.
+- Async-native worker на TaskIQ использует тот же паттерн `AsyncSession`, что и API.
+- Распределенный rate limiting для `POST /bookings` работает через Redis.
+- Тесты запускаются без Docker за счет SQLite async и `fakeredis`.
+- Структурированные логи фиксируют mock-побочные эффекты внешней интеграции, например
+  `notification_sent`.
+
 ## Общая архитектура
 
 - **FastAPI** предоставляет REST API и валидирует запросы через Pydantic v2.
