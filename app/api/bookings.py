@@ -60,7 +60,7 @@ async def create_booking(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> BookingRead:
     booking = await crud.create_booking(session, payload)
-    confirm_booking_task.delay(str(booking.id))
+    await confirm_booking_task.kiq(str(booking.id))
     return BookingRead.model_validate(booking)
 
 
