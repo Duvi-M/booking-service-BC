@@ -9,12 +9,13 @@ en logs JSON; si falla, pasa a `failed`.
 ## Arquitectura general
 
 - **FastAPI** expone la REST API y valida requests con Pydantic v2.
-- **SQLAlchemy 2.0 async** implementa el acceso a datos sin bloquear el event loop.
+- **SQLAlchemy 2.0 async** implementa el acceso a datos de la API sin bloquear el event loop.
+- **SQLAlchemy síncrono** se usa en el worker Celery con un engine independiente.
 - **PostgreSQL** es la base de datos de runtime.
 - **Alembic** versiona el schema y crea la tabla `bookings`.
-- **Redis** funciona como broker/result backend de Celery.
+- **Redis** funciona como broker/result backend de Celery y como backend distribuido del rate limit.
 - **Celery** ejecuta el procesamiento asíncrono de confirmación de reservas.
-- **pytest + SQLite async** permiten correr tests sin Docker, Postgres ni Redis reales.
+- **pytest + SQLite** permiten correr tests sin Docker, Postgres ni Redis reales.
 - **Docker Compose** levanta API, worker, PostgreSQL y Redis con una sola orden.
 
 ## Por qué estas decisiones
@@ -31,12 +32,22 @@ tipos sólidos, migraciones reproducibles y una capa ORM async sin SQL raw.
 
 ## Idempotencia del worker
 
-La task `bookings.confirm_booking` consulta la reserva antes de hacer cualquier cambio:
+La task `bookings.confirm_booking` usa un `UPDATE` condicional atómico:
 
-- Si el `booking_id` no existe, loggea el caso y termina sin romper.
-- Si el estado ya no es `pending`, no llama a la integración externa y no modifica nada.
-- Si se ejecuta dos veces sobre la misma reserva, la segunda ejecución observa `confirmed`,
-  `failed` o `cancelled` y sale sin duplicar notificaciones ni pisar estado.
+```sql
+UPDATE bookings
+SET status = :new_status, updated_at = now()
+WHERE id = :booking_id AND status = 'pending'
+RETURNING id
+```
+
+Solo la ejecución que actualiza una fila confirma o falla la reserva y emite logs de resultado.
+Si otra ejecución ya cambió el estado, la task sale sin reenviar notificaciones ni pisar estado.
+Antes de simular la integración externa, el worker consulta el estado actual para evitar trabajo
+innecesario cuando la reserva ya no está `pending`.
+
+El worker usa un engine SQLAlchemy síncrono separado del engine async de FastAPI. El trade-off es
+mantener dos factories de sesión, pero evita mezclar event loops async con procesos Celery prefork.
 
 ## Retry con backoff
 
@@ -93,7 +104,8 @@ pip install -r requirements.txt
 pytest
 ```
 
-Durante tests se usa SQLite async y se mockea el envío de la task Celery para evitar Redis.
+Durante tests se usa SQLite async para la API, SQLite síncrono para el worker y `fakeredis` para
+el rate limit. El envío de la task Celery se mockea para evitar Redis real.
 
 ## Makefile
 
@@ -159,12 +171,31 @@ No hay borrado físico: el estado pasa a `cancelled`.
 
 ## Rate limiting
 
-`POST /bookings` incluye un rate limiting simple en memoria por IP. Es deliberadamente pequeño
-y suficiente para el test. En producción se movería a Redis para compartir estado entre réplicas.
+`POST /bookings` incluye rate limiting distribuido por IP usando Redis con una ventana fija
+`INCR + EXPIRE`. Esto funciona correctamente con múltiples réplicas de Uvicorn porque el contador
+no vive en memoria local del proceso.
+
+Trade-off: se eligió ventana fija por simplicidad operacional; una sliding window con sorted sets
+sería más precisa, pero también más costosa para este alcance.
+
+## Cambios respecto a la versión anterior
+
+- Worker idempotente con `UPDATE` condicional atómico.
+- Worker Celery con engine SQLAlchemy síncrono independiente.
+- Rate limiting movido de memoria local a Redis distribuido.
+- Validación de reservas para rechazar fechas pasadas.
+- Índice compuesto `(status, created_at DESC)` para listados paginados por estado.
+- Typing moderno en la migración inicial.
+- README actualizado con limitaciones y decisiones vigentes.
 
 ## Limitaciones conocidas
 
 - La integración externa está simulada con probabilidad configurable de fallo.
-- El rate limiting en memoria no es distribuido.
-- No hay autenticación/autorización porque no forma parte del alcance.
+- La idempotencia del worker está garantizada con `UPDATE` condicional atómico incluso bajo
+  ejecución concurrente.
+- El worker usa un engine síncrono independiente del engine async de la API para evitar problemas
+  de event loop en procesos Celery prefork.
+- No hay soft-delete ni auditoría histórica de cambios de estado; se conserva el estado final,
+  pero no quién ni cuándo intentó una transición inválida.
+- No hay autenticación/autorización porque está fuera del alcance del test.
 - No se guarda una tabla de notificaciones; el mock queda registrado en logs estructurados.
