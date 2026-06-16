@@ -2,20 +2,20 @@
 
 Backend service pequeño, async y listo para entregar como test técnico de Python Backend.
 Permite crear, consultar, listar y cancelar reservas de citas. Cuando se crea una reserva, el
-API la guarda como `pending` y dispara una tarea Celery que simula una integración externa:
+API la guarda como `pending` y dispara una tarea TaskIQ que simula una integración externa:
 si la integración sale bien, la reserva pasa a `confirmed` y se registra una notificación mock
 en logs JSON; si falla, pasa a `failed`.
 
 ## Arquitectura general
 
 - **FastAPI** expone la REST API y valida requests con Pydantic v2.
-- **SQLAlchemy 2.0 async** implementa el acceso a datos de la API sin bloquear el event loop.
-- **SQLAlchemy síncrono** se usa en el worker Celery con un engine independiente.
+- **SQLAlchemy 2.0 async** implementa el acceso a datos de la API y del worker sin bloquear el
+  event loop.
 - **PostgreSQL** es la base de datos de runtime.
 - **Alembic** versiona el schema y crea la tabla `bookings`.
-- **Redis** funciona como broker/result backend de Celery y como backend distribuido del rate limit.
-- **Celery** ejecuta el procesamiento asíncrono de confirmación de reservas.
-- **pytest + SQLite** permiten correr tests sin Docker, Postgres ni Redis reales.
+- **Redis** funciona como broker de TaskIQ y como backend distribuido del rate limit.
+- **TaskIQ** ejecuta el procesamiento async-nativo de confirmación de reservas.
+- **pytest + SQLite async** permiten correr tests sin Docker, Postgres ni Redis reales.
 - **Docker Compose** levanta API, worker, PostgreSQL y Redis con una sola orden.
 
 ## Por qué estas decisiones
@@ -23,9 +23,9 @@ en logs JSON; si falla, pasa a `failed`.
 **FastAPI** encaja bien para un servicio REST pequeño: validación clara, OpenAPI automático,
 soporte async nativo y bajo coste de mantenimiento.
 
-**Celery + Redis** separa el request HTTP del trabajo externo. El API responde rápido y la
-confirmación queda delegada al worker. Redis es suficiente como broker para este alcance y
-mantiene el compose simple.
+**TaskIQ + Redis** separa el request HTTP del trabajo externo. El API responde rápido y la
+confirmación queda delegada al worker. TaskIQ permite mantener el worker async-nativo usando el
+mismo patrón de `AsyncSession` que FastAPI, y Redis mantiene el compose simple.
 
 **PostgreSQL + SQLAlchemy + Alembic** da una base robusta para producción: transacciones,
 tipos sólidos, migraciones reproducibles y una capa ORM async sin SQL raw.
@@ -46,14 +46,18 @@ Si otra ejecución ya cambió el estado, la task sale sin reenviar notificacione
 Antes de simular la integración externa, el worker consulta el estado actual para evitar trabajo
 innecesario cuando la reserva ya no está `pending`.
 
-El worker usa un engine SQLAlchemy síncrono separado del engine async de FastAPI. El trade-off es
-mantener dos factories de sesión, pero evita mezclar event loops async con procesos Celery prefork.
+El worker usa el mismo engine async que FastAPI. Ya no hace falta el engine síncrono dedicado que
+existía para rodear la naturaleza prefork/síncrona de Celery.
 
 ## Retry con backoff
 
-La task usa `autoretry_for=(Exception,)`, `retry_backoff=True`, jitter y `max_retries=3`.
-Los fallos esperados de la integración simulada no levantan excepción: actualizan la reserva a
-`failed`. El retry queda reservado para errores inesperados de infraestructura o ejecución.
+La task TaskIQ implementa retry manual dentro de la corrutina: máximo 3 intentos, backoff
+exponencial y jitter pequeño antes de reintentar. Los fallos esperados de la integración simulada
+no levantan excepción: actualizan la reserva a `failed`. El retry queda reservado para errores
+inesperados de infraestructura o ejecución.
+
+Nota de implementación: TaskIQ incluye middleware de retry, pero aquí se eligió retry manual para
+mantener el backoff local explícito y no depender de scheduling/requeue diferido para este alcance.
 
 ## Logging
 
@@ -104,8 +108,8 @@ pip install -r requirements.txt
 pytest
 ```
 
-Durante tests se usa SQLite async para la API, SQLite síncrono para el worker y `fakeredis` para
-el rate limit. El envío de la task Celery se mockea para evitar Redis real.
+Durante tests se usa SQLite async para la API y el worker, y `fakeredis` para el rate limit. El
+envío de la task TaskIQ se mockea para evitar Redis real.
 
 ## Makefile
 
@@ -181,9 +185,10 @@ sería más precisa, pero también más costosa para este alcance.
 ## Cambios respecto a la versión anterior
 
 - Worker idempotente con `UPDATE` condicional atómico.
-- Worker Celery con engine SQLAlchemy síncrono independiente.
+- Worker TaskIQ async-nativo con `AsyncSession`, reemplazando Celery y el engine síncrono.
 - Rate limiting movido de memoria local a Redis distribuido.
 - Validación de reservas para rechazar fechas pasadas.
+- Migración de Celery a TaskIQ como quinto plus técnico del backend async.
 - Índice compuesto `(status, created_at DESC)` para listados paginados por estado.
 - Typing moderno en la migración inicial.
 - README actualizado con limitaciones y decisiones vigentes.
@@ -193,8 +198,8 @@ sería más precisa, pero también más costosa para este alcance.
 - La integración externa está simulada con probabilidad configurable de fallo.
 - La idempotencia del worker está garantizada con `UPDATE` condicional atómico incluso bajo
   ejecución concurrente.
-- El worker usa un engine síncrono independiente del engine async de la API para evitar problemas
-  de event loop en procesos Celery prefork.
+- El worker usa `AsyncSession` directamente gracias a TaskIQ; ya no existe engine síncrono
+  específico para tareas.
 - No hay soft-delete ni auditoría histórica de cambios de estado; se conserva el estado final,
   pero no quién ni cuándo intentó una transición inválida.
 - No hay autenticación/autorización porque está fuera del alcance del test.
